@@ -241,23 +241,47 @@ void FoxgloveBridge::rosgraphPollThread() {
   updateAdvertisedServices();
 
   auto graphEvent = this->get_graph_event();
+  const auto threadStart = std::chrono::steady_clock::now();
+  auto lastFallbackPoll = threadStart;
+  constexpr auto kFallbackPollInterval = std::chrono::seconds(10);
+  constexpr auto kFallbackPollDeadline = std::chrono::minutes(2);
   while (!_shuttingDown && rclcpp::ok()) {
+    bool shouldUpdate = false;
     try {
       this->wait_for_graph_change(graphEvent, 200ms);
-      bool triggered = graphEvent->check_and_clear();
-      if (triggered) {
+      if (graphEvent->check_and_clear()) {
         RCLCPP_DEBUG(this->get_logger(), "rosgraph change detected");
+        shouldUpdate = true;
+      }
+    } catch (const std::exception& ex) {
+      // wait_for_graph_change throws on timeout; that's expected.
+      RCLCPP_DEBUG(this->get_logger(), "wait_for_graph_change: %s", ex.what());
+    }
+
+    // Fallback periodic rescan, capped to the first 2 minutes of node lifetime.
+    // Works around rclcpp graph events that stop firing in composable-node hosts
+    // with intra-process comms after the initial discovery burst.
+    auto now = std::chrono::steady_clock::now();
+    if (now - threadStart < kFallbackPollDeadline &&
+        now - lastFallbackPoll >= kFallbackPollInterval) {
+      shouldUpdate = true;
+      lastFallbackPoll = now;
+    }
+
+    if (shouldUpdate) {
+      try {
         const auto topicNamesAndTypes = get_topic_names_and_types();
         updateAdvertisedTopics(topicNamesAndTypes);
         updateAdvertisedServices();
         if (_subscribeGraphUpdates) {
           updateConnectionGraph(topicNamesAndTypes);
         }
-        // Graph changes tend to come in batches, so wait a bit before checking again
-        std::this_thread::sleep_for(500ms);
+      } catch (const std::exception& ex) {
+        RCLCPP_ERROR(this->get_logger(),
+                     "Exception thrown updating advertised topics: %s", ex.what());
       }
-    } catch (const std::exception& ex) {
-      RCLCPP_ERROR(this->get_logger(), "Exception thrown in rosgraphPollThread: %s", ex.what());
+      // Graph changes tend to come in batches, so wait a bit before checking again
+      std::this_thread::sleep_for(500ms);
     }
   }
 
